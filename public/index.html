@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101827">
+<title>Conecta TV</title>
+
+<style>
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #101827;
+  color: #f1f5f9;
+  font-family: system-ui, sans-serif;
+}
+
+header {
+  padding: 18px;
+  background: #172338;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+h1 { margin: 0 0 10px; font-size: 24px; }
+
+main {
+  width: min(850px, 100%);
+  margin: auto;
+  padding: 16px;
+}
+
+.panel {
+  background: #1b293d;
+  padding: 14px;
+  border-radius: 14px;
+  margin-bottom: 14px;
+}
+
+input, button, textarea {
+  font: inherit;
+  padding: 12px;
+  border-radius: 9px;
+  border: 1px solid #42516a;
+}
+
+input, textarea {
+  background: #0f1929;
+  color: white;
+  width: 100%;
+  margin: 5px 0;
+}
+
+button {
+  background: #2563eb;
+  color: white;
+  border: 0;
+  margin: 4px 2px;
+  cursor: pointer;
+}
+
+button:disabled { opacity: .5; }
+
+.row {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.row input { flex: 1; min-width: 130px; }
+
+#messages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 160px;
+}
+
+.message {
+  background: #26364d;
+  border-radius: 12px;
+  padding: 12px;
+  overflow-wrap: anywhere;
+}
+
+.message img {
+  display: block;
+  max-width: 100%;
+  max-height: 350px;
+  object-fit: contain;
+  margin-top: 8px;
+  border-radius: 8px;
+}
+
+.meta {
+  color: #aabbd1;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+#status { font-size: 14px; }
+small { color: #b6c6dc; }
+</style>
+</head>
+
+<body>
+<header>
+  <h1>📺 Conecta TV</h1>
+  <div id="status">Desconectado</div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Entrar na sala</h2>
+
+    <label for="name">Seu nome</label>
+    <input id="name" maxlength="30"
+      placeholder="Ex.: Meu celular">
+
+    <label for="room">Código da sala</label>
+    <div class="row">
+      <input id="room" maxlength="40"
+        placeholder="Código compartilhado">
+      <button id="connect">Conectar</button>
+    </div>
+
+    <button id="share">Copiar link da sala</button>
+    <small>Todos precisam usar o mesmo código.</small>
+  </section>
+
+  <section class="panel">
+    <h2>Mensagens</h2>
+    <div id="messages" aria-live="polite"></div>
+    <p id="empty">As mensagens aparecerão aqui.</p>
+
+    <textarea id="text" maxlength="2000"
+      rows="3" placeholder="Escreva uma mensagem..."></textarea>
+
+    <div class="row">
+      <button id="send">Enviar mensagem</button>
+      <button id="pick">Escolher imagem</button>
+      <input id="image" type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        hidden>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Conexão Bluetooth</h2>
+    <p>
+      A sincronização funciona pela internet.
+      O Bluetooth depende do suporte do navegador
+      e do dispositivo.
+    </p>
+
+    <button id="bluetooth">
+      Verificar suporte Bluetooth
+    </button>
+
+    <small id="btStatus">
+      Não conectado por Bluetooth.
+    </small>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+let socket = null;
+let retryTimer = null;
+let manualClose = false;
+let messagesSeen = new Set();
+let retryCount = 0;
+
+const params = new URLSearchParams(location.search);
+const roomInput = $("room");
+
+function makeRoom() {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+
+  return Array.from(bytes,
+    b => b.toString(16).padStart(2, "0")).join("");
+}
+
+roomInput.value = params.get("sala") || makeRoom();
+
+function setStatus(text) {
+  $("status").textContent = text;
+}
+
+function sendPacket(data) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    alert("Conecte-se à sala primeiro.");
+    return false;
+  }
+
+  socket.send(JSON.stringify(data));
+  return true;
+}
+
+function connect() {
+  manualClose = true;
+  clearTimeout(retryTimer);
+
+  if (socket) socket.close();
+
+  const room = roomInput.value.trim();
+
+  if (!/^[a-zA-Z0-9_-]{8,40}$/.test(room)) {
+    alert("Use um código com 8 a 40 letras ou números.");
+    return;
+  }
+
+  manualClose = false;
+  retryCount = 0;
+  messagesSeen.clear();
+  $("messages").replaceChildren();
+  $("empty").hidden = false;
+
+  if (!location.host || location.protocol === "file:") {
+    setStatus("Abra o endereço publicado do aplicativo.");
+    return;
+  }
+
+  const protocol = location.protocol === "https:"
+    ? "wss:" : "ws:";
+
+  socket = new WebSocket(
+    protocol + "//" + location.host + "/ws"
+  );
+
+  setStatus("Conectando...");
+
+  socket.onopen = () => {
+    retryCount = 0;
+    setStatus("Conectado ✓");
+    sendPacket({ type: "join", room });
+  };
+
+  socket.onmessage = event => {
+    let data;
+
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (data.type === "history") {
+      (data.messages || []).forEach(renderMessage);
+    } else if (data.type === "chat" ||
+               data.type === "image") {
+      renderMessage(data);
+    } else if (data.type === "error") {
+      setStatus(data.text);
+    }
+  };
+
+  socket.onclose = () => {
+    setStatus("Desconectado");
+
+    if (!manualClose) scheduleReconnect();
+  };
+
+  socket.onerror = () => {
+    setStatus("Erro de conexão. Verifique o endereço.");
+  };
+}
+
+function scheduleReconnect() {
+  clearTimeout(retryTimer);
+
+  const delay = Math.min(1000 * (2 ** retryCount), 30000);
+  retryCount++;
+
+  retryTimer = setTimeout(() => {
+    if (!manualClose) connect();
+  }, delay);
+}
+
+function renderMessage(message) {
+  if (!message || !message.id ||
+      messagesSeen.has(message.id)) return;
+
+  messagesSeen.add(message.id);
+  $("empty").hidden = true;
+
+  const card = document.createElement("article");
+  card.className = "message";
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+
+  const date = message.time
+    ? new Date(message.time).toLocaleTimeString()
+    : "";
+
+  meta.textContent =
+    (message.sender || "Visitante") + " · " + date;
+
+  card.appendChild(meta);
+
+  if (message.type === "image") {
+    const img = document.createElement("img");
+    img.alt = "Imagem compartilhada";
+    img.src = message.data;
+    img.loading = "lazy";
+    card.appendChild(img);
+  } else {
+    const text = document.createElement("div");
+    text.textContent = message.text || "";
+    card.appendChild(text);
+  }
+
+  $("messages").appendChild(card);
+
+  $("messages").scrollIntoView({
+    behavior: "smooth",
+    block: "end"
+  });
+}
+
+$("connect").addEventListener("click", connect);
+
+$("send").addEventListener("click", () => {
+  const text = $("text").value.trim();
+  if (!text) return;
+
+  if (sendPacket({
+    type: "chat",
+    text,
+    sender: $("name").value.trim() || "Visitante"
+  })) {
+    $("text").value = "";
+  }
+});
+
+$("text").addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    $("send").click();
+  }
+});
+
+$("pick").addEventListener("click", () => {
+  $("image").click();
+});
+
+$("image").addEventListener("change", event => {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  if (![
+    "image/png", "image/jpeg",
+    "image/webp", "image/gif"
+  ].includes(file.type)) {
+    alert("Escolha uma imagem PNG, JPEG, WebP ou GIF.");
+    event.target.value = "";
+    return;
+  }
+
+  if (file.size > 400000) {
+    alert("A imagem deve ter menos de 400 KB.");
+    event.target.value = "";
+    return;
+  }
+
+  const reader = new FileReader();
+
+  reader.onload = () => {
+    sendPacket({
+      type: "image",
+      data: reader.result,
+      sender: $("name").value.trim() || "Visitante"
+    });
+
+    event.target.value = "";
+  };
+
+  reader.readAsDataURL(file);
+});
+
+$("share").addEventListener("click", async () => {
+  const url = new URL(location.href);
+  url.searchParams.set("sala", roomInput.value.trim());
+
+  try {
+    await navigator.clipboard.writeText(url.href);
+    alert("Link copiado! Compartilhe somente com pessoas de confiança.");
+  } catch {
+    prompt("Copie este link:", url.href);
+  }
+});
+
+$("bluetooth").addEventListener("click", () => {
+  if (!navigator.bluetooth) {
+    $("btStatus").textContent =
+      "Bluetooth não disponível neste navegador.";
+    return;
+  }
+
+  $("btStatus").textContent =
+    "O navegador oferece Web Bluetooth, mas ainda é necessário implementar a conexão com um dispositivo compatível.";
+});
+</script>
+</body>
+  </html>
+  
